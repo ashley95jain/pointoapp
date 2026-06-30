@@ -37,6 +37,15 @@ export type Database = {
           created_at?: string;
           updated_at?: string;
         };
+        Relationships: [
+          {
+            foreignKeyName: 'profiles_referred_by_fkey';
+            columns: ['referred_by'];
+            isOneToOne: false;
+            referencedRelation: 'profiles';
+            referencedColumns: ['id'];
+          },
+        ];
       };
       missions: {
         Row: {
@@ -66,6 +75,7 @@ export type Database = {
           sort_order?: number;
           created_at?: string;
         };
+        Relationships: [];
       };
       mission_completions: {
         Row: {
@@ -86,6 +96,29 @@ export type Database = {
           point_transaction_id?: string | null;
           completed_at?: string;
         };
+        Relationships: [
+          {
+            foreignKeyName: 'mission_completions_mission_id_fkey';
+            columns: ['mission_id'];
+            isOneToOne: false;
+            referencedRelation: 'missions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'mission_completions_point_transaction_id_fkey';
+            columns: ['point_transaction_id'];
+            isOneToOne: false;
+            referencedRelation: 'point_transactions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'mission_completions_profile_id_fkey';
+            columns: ['profile_id'];
+            isOneToOne: false;
+            referencedRelation: 'profiles';
+            referencedColumns: ['id'];
+          },
+        ];
       };
       point_transactions: {
         Row: {
@@ -112,8 +145,18 @@ export type Database = {
           metadata?: Json;
           created_at?: string;
         };
+        Relationships: [
+          {
+            foreignKeyName: 'point_transactions_profile_id_fkey';
+            columns: ['profile_id'];
+            isOneToOne: false;
+            referencedRelation: 'profiles';
+            referencedColumns: ['id'];
+          },
+        ];
       };
     };
+    Views: Record<string, never>;
     Functions: {
       claim_mission: {
         Args: {
@@ -129,5 +172,7 @@ export type Database = {
         }[];
       };
     };
+    Enums: Record<string, never>;
+    CompositeTypes: Record<string, never>;
   };
 };
