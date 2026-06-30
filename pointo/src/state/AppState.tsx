@@ -8,6 +8,7 @@ import React, {
   useState,
 } from 'react';
 import { Platform } from 'react-native';
+import * as Linking from 'expo-linking';
 import {
   INITIAL_POINTS,
   initialMissions,
@@ -19,6 +20,11 @@ import {
   referralCodeForUserId,
   type AuthenticatedUser,
 } from '../services/auth';
+import {
+  parseReferralUrl,
+  tryRedeemReferralCode,
+  REFERRAL_INSTALL_REWARD,
+} from '../services/referral';
 import {
   clearAuthToken,
   clearLedger,
@@ -34,6 +40,12 @@ export type AuthStep =
   | { kind: 'awaiting-code'; phone: string; verificationId: string; demoCode?: string }
   | { kind: 'authenticated' };
 
+export type ReferralRedemption = {
+  code: string;
+  pointsCredited: number;
+  at: number;
+};
+
 type AppStateValue = {
   isHydrated: boolean;
   authStep: AuthStep;
@@ -43,6 +55,7 @@ type AppStateValue = {
   referralCode: string;
   referralUrl: string;
   completedCount: number;
+  lastReferralRedemption: ReferralRedemption | null;
 
   requestCode: (phone: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
   verifyCode: (
@@ -52,6 +65,14 @@ type AppStateValue = {
   cancelCodeEntry: () => void;
   logout: () => Promise<void>;
   claimMission: (id: MissionId) => Mission | undefined;
+
+  /**
+   * Process a Universal Link / custom-scheme URL. Returns the credited
+   * reward when the code is fresh, otherwise null. The result is also
+   * exposed via `lastReferralRedemption` so the UI can show a celebration.
+   */
+  handleIncomingUrl: (url: string) => Promise<ReferralRedemption | null>;
+  acknowledgeReferralRedemption: () => void;
 };
 
 const AppStateContext = createContext<AppStateValue | undefined>(undefined);
@@ -62,6 +83,8 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthenticatedUser | null>(null);
   const [points, setPoints] = useState(INITIAL_POINTS);
   const [missions, setMissions] = useState<Mission[]>(initialMissions);
+  const [lastReferralRedemption, setLastReferralRedemption] =
+    useState<ReferralRedemption | null>(null);
 
   const hasHydratedRef = useRef(false);
 
@@ -120,6 +143,66 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     };
     void saveLedger(snapshot);
   }, [user, points, missions]);
+
+  // ---------------------------------------------------------------------
+  // Deep-link / referral ingestion
+  // ---------------------------------------------------------------------
+  const handleIncomingUrl = useCallback(
+    async (url: string): Promise<ReferralRedemption | null> => {
+      const parsed = parseReferralUrl(url);
+      if (!parsed) return null;
+
+      // Don't credit users for opening their own invite link.
+      if (user && parsed.code === referralCodeForUserId(user.id)) {
+        return null;
+      }
+
+      const fresh = await tryRedeemReferralCode(parsed.code);
+      if (!fresh) return null;
+
+      const credited = REFERRAL_INSTALL_REWARD;
+      setPoints((current) => current + credited);
+      setMissions((current) =>
+        current.map((m) => (m.id === 'install' ? { ...m, completed: true } : m)),
+      );
+
+      const redemption: ReferralRedemption = {
+        code: parsed.code,
+        pointsCredited: credited,
+        at: Date.now(),
+      };
+      setLastReferralRedemption(redemption);
+      return redemption;
+    },
+    [user],
+  );
+
+  const acknowledgeReferralRedemption = useCallback(() => {
+    setLastReferralRedemption(null);
+  }, []);
+
+  // Listen for inbound URLs once hydration completes. We check the initial
+  // URL (cold-start) and subscribe to runtime events (warm-start).
+  useEffect(() => {
+    if (!isHydrated) return;
+    let cancelled = false;
+
+    (async () => {
+      const initial = await Linking.getInitialURL();
+      if (initial && !cancelled) {
+        await handleIncomingUrl(initial);
+      }
+    })();
+
+    const sub = Linking.addEventListener('url', ({ url }) => {
+      void handleIncomingUrl(url);
+    });
+
+    return () => {
+      cancelled = true;
+      sub.remove();
+    };
+  }, [isHydrated, handleIncomingUrl]);
 
   // ---------------------------------------------------------------------
   // Auth flow
@@ -211,11 +294,14 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       referralCode,
       referralUrl,
       completedCount,
+      lastReferralRedemption,
       requestCode,
       verifyCode,
       cancelCodeEntry,
       logout,
       claimMission,
+      handleIncomingUrl,
+      acknowledgeReferralRedemption,
     }),
     [
       isHydrated,
@@ -226,11 +312,14 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       referralCode,
       referralUrl,
       completedCount,
+      lastReferralRedemption,
       requestCode,
       verifyCode,
       cancelCodeEntry,
       logout,
       claimMission,
+      handleIncomingUrl,
+      acknowledgeReferralRedemption,
     ],
   );
 
