@@ -12,6 +12,7 @@ import { StatusBar } from 'expo-status-bar';
 import { BrandHeader } from '../components/BrandHeader';
 import { Card } from '../components/Card';
 import { MissionRow } from '../components/MissionRow';
+import { NotificationsCard } from '../components/NotificationsCard';
 import { PointsHeader } from '../components/PointsHeader';
 import { colors } from '../theme/colors';
 import { useAppState } from '../state/AppState';
@@ -82,6 +83,8 @@ export function HomeScreen() {
             />
           ))}
         </Card>
+
+        <NotificationsCard />
 
         <Pressable onPress={logout} style={styles.logoutPressable}>
           <Text style={styles.logoutLabel}>Sign out</Text>
