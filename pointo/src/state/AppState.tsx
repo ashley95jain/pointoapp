@@ -19,6 +19,18 @@ import {
   type Mission,
   type MissionId,
 } from '../data/missions';
+import { initialRewards, rewardById, type Reward, type RewardId } from '../data/rewards';
+import {
+  generateVoucherCode,
+  nextRedemptionId,
+  type Redemption,
+} from '../data/redemptions';
+import {
+  MAX_TRANSACTION_LOG,
+  nextTransactionId,
+  type PointTransaction,
+  type TransactionKind,
+} from '../data/transactions';
 import {
   authProvider,
   referralCodeForUserId,
@@ -63,6 +75,10 @@ export type WalkMilestoneEvent = {
   at: number;
 };
 
+export type RedeemResult =
+  | { ok: true; redemption: Redemption }
+  | { ok: false; reason: string };
+
 type AppStateValue = {
   isHydrated: boolean;
   authStep: AuthStep;
@@ -78,6 +94,13 @@ type AppStateValue = {
   stepsAuthorization: StepsAuthorization;
   creditedWalkMilestones: ReadonlyArray<number>;
   lastWalkMilestone: WalkMilestoneEvent | null;
+
+  rewards: ReadonlyArray<Reward>;
+  transactions: ReadonlyArray<PointTransaction>;
+  redemptions: ReadonlyArray<Redemption>;
+  lastRedemption: Redemption | null;
+  redeemReward: (rewardId: RewardId) => RedeemResult;
+  acknowledgeRedemption: () => void;
 
   requestCode: (phone: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
   verifyCode: (
@@ -121,7 +144,44 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
   const [lastWalkMilestone, setLastWalkMilestone] =
     useState<WalkMilestoneEvent | null>(null);
 
+  const [transactions, setTransactions] = useState<PointTransaction[]>([]);
+  const [redemptions, setRedemptions] = useState<Redemption[]>([]);
+  const [lastRedemption, setLastRedemption] = useState<Redemption | null>(null);
+
   const hasHydratedRef = useRef(false);
+
+  /**
+   * Single source of truth for point movements. Atomically updates the
+   * running balance and prepends to the transaction log (capped at
+   * MAX_TRANSACTION_LOG so the persisted snapshot stays bounded). Returns
+   * the synthesized transaction so callers can keep handles to it.
+   */
+  const addTransaction = useCallback(
+    (input: {
+      kind: TransactionKind;
+      delta: number;
+      label: string;
+      meta?: Record<string, string | number>;
+    }): PointTransaction => {
+      const tx: PointTransaction = {
+        id: nextTransactionId(),
+        kind: input.kind,
+        delta: input.delta,
+        label: input.label,
+        at: Date.now(),
+        meta: input.meta,
+      };
+      setPoints((current) => current + input.delta);
+      setTransactions((current) => {
+        const next = [tx, ...current];
+        return next.length > MAX_TRANSACTION_LOG
+          ? next.slice(0, MAX_TRANSACTION_LOG)
+          : next;
+      });
+      return tx;
+    },
+    [],
+  );
 
   const referralCode = useMemo(
     () => (user ? referralCodeForUserId(user.id) : 'PT-WELCOME'),
@@ -154,6 +214,8 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
         setMissions(
           initialMissions.map((m) => ({ ...m, completed: completedSet.has(m.id) })),
         );
+        setTransactions(snapshot.transactions);
+        setRedemptions(snapshot.redemptions);
 
         // Daily milestone reset: if the persisted day key doesn't match
         // today we drop the credited-milestone list so a new set of
@@ -185,15 +247,25 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!hasHydratedRef.current) return;
     const snapshot: LedgerSnapshot = {
-      version: 3,
+      version: 4,
       user,
       points,
       completedMissionIds: missions.filter((m) => m.completed).map((m) => m.id),
       walkMilestoneDay,
       creditedWalkMilestones,
+      transactions,
+      redemptions,
     };
     void saveLedger(snapshot);
-  }, [user, points, missions, walkMilestoneDay, creditedWalkMilestones]);
+  }, [
+    user,
+    points,
+    missions,
+    walkMilestoneDay,
+    creditedWalkMilestones,
+    transactions,
+    redemptions,
+  ]);
 
   // ---------------------------------------------------------------------
   // Step tracking
@@ -264,7 +336,14 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     const lastNew = newlyCrossed[newlyCrossed.length - 1];
     const totalNewReward = newlyCrossed.reduce((acc, m) => acc + m.reward, 0);
 
-    setPoints((current) => current + totalNewReward);
+    for (const milestone of newlyCrossed) {
+      addTransaction({
+        kind: 'walk-milestone',
+        delta: milestone.reward,
+        label: `${milestone.steps.toLocaleString()} steps milestone`,
+        meta: { milestoneSteps: milestone.steps },
+      });
+    }
     setCreditedWalkMilestones([...credited, ...newlyCrossed.map((m) => m.steps)]);
     setLastWalkMilestone({
       steps: lastNew.steps,
@@ -284,6 +363,7 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     todaySteps,
     walkMilestoneDay,
     creditedWalkMilestones,
+    addTransaction,
   ]);
 
   // ---------------------------------------------------------------------
@@ -303,7 +383,12 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       if (!fresh) return null;
 
       const credited = REFERRAL_INSTALL_REWARD;
-      setPoints((current) => current + credited);
+      addTransaction({
+        kind: 'referral-install',
+        delta: credited,
+        label: 'Referral install bonus',
+        meta: { code: parsed.code },
+      });
       setMissions((current) =>
         current.map((m) => (m.id === 'install' ? { ...m, completed: true } : m)),
       );
@@ -316,7 +401,7 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       setLastReferralRedemption(redemption);
       return redemption;
     },
-    [user],
+    [user, addTransaction],
   );
 
   const acknowledgeReferralRedemption = useCallback(() => {
@@ -403,6 +488,9 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     setPoints(INITIAL_POINTS);
     setCreditedWalkMilestones([]);
     setLastWalkMilestone(null);
+    setTransactions([]);
+    setRedemptions([]);
+    setLastRedemption(null);
     stepsCounter.stop();
     stepsCounter.resetDemoSteps();
     await Promise.all([clearAuthToken(), clearLedger()]);
@@ -428,6 +516,49 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // ---------------------------------------------------------------------
+  // Redemptions
+  // ---------------------------------------------------------------------
+  const redeemReward = useCallback(
+    (rewardId: RewardId): RedeemResult => {
+      const reward = rewardById(rewardId);
+      if (!reward) {
+        return { ok: false, reason: 'Reward not found.' };
+      }
+      if (points < reward.cost) {
+        return {
+          ok: false,
+          reason: `You need ${(reward.cost - points).toLocaleString()} more points to redeem this.`,
+        };
+      }
+
+      const redemption: Redemption = {
+        id: nextRedemptionId(),
+        rewardId: reward.id,
+        rewardTitle: reward.title,
+        rewardCategory: reward.category,
+        pointsSpent: reward.cost,
+        voucherCode: generateVoucherCode(),
+        redeemedAt: Date.now(),
+        status: 'fulfilled',
+      };
+      addTransaction({
+        kind: 'redemption',
+        delta: -reward.cost,
+        label: `Redeemed ${reward.title}`,
+        meta: { rewardId: reward.id, voucherCode: redemption.voucherCode },
+      });
+      setRedemptions((current) => [redemption, ...current]);
+      setLastRedemption(redemption);
+      return { ok: true, redemption };
+    },
+    [points, addTransaction],
+  );
+
+  const acknowledgeRedemption = useCallback(() => {
+    setLastRedemption(null);
+  }, []);
+
+  // ---------------------------------------------------------------------
   // Missions
   // ---------------------------------------------------------------------
   const claimMission = useCallback(
@@ -438,10 +569,15 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       setMissions((current) =>
         current.map((m) => (m.id === id ? { ...m, completed: true } : m)),
       );
-      setPoints((current) => current + mission.points);
+      addTransaction({
+        kind: 'mission',
+        delta: mission.points,
+        label: mission.title,
+        meta: { missionId: mission.id },
+      });
       return mission;
     },
-    [missions],
+    [missions, addTransaction],
   );
 
   const completedCount = useMemo(
@@ -464,6 +600,12 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       stepsAuthorization,
       creditedWalkMilestones,
       lastWalkMilestone,
+      rewards: initialRewards,
+      transactions,
+      redemptions,
+      lastRedemption,
+      redeemReward,
+      acknowledgeRedemption,
       requestCode,
       verifyCode,
       cancelCodeEntry,
@@ -490,6 +632,11 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       stepsAuthorization,
       creditedWalkMilestones,
       lastWalkMilestone,
+      transactions,
+      redemptions,
+      lastRedemption,
+      redeemReward,
+      acknowledgeRedemption,
       requestCode,
       verifyCode,
       cancelCodeEntry,

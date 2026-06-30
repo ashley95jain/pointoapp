@@ -2,6 +2,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 import type { MissionId } from '../data/missions';
+import type { Redemption } from '../data/redemptions';
+import type { PointTransaction } from '../data/transactions';
 import { stableUserId, type AuthenticatedUser } from '../services/auth';
 
 const LEDGER_KEY = 'pointo:ledger:v1';
@@ -16,14 +18,17 @@ const TOKEN_WEB_FALLBACK_KEY = 'pointo:authToken:webFallback';
  * v1 (Phase 1.2): { isLoggedIn, name, phone, points, completedMissionIds }
  * v2 (Phase 2.1): { user | null, points, completedMissionIds }
  * v3 (Phase 2.3): + { walkMilestoneDay, creditedWalkMilestones }
+ * v4 (Phase 2.4): + { transactions, redemptions }
  */
 export type LedgerSnapshot = {
-  version: 3;
+  version: 4;
   user: AuthenticatedUser | null;
   points: number;
   completedMissionIds: MissionId[];
   walkMilestoneDay: string | null;
   creditedWalkMilestones: number[];
+  transactions: PointTransaction[];
+  redemptions: Redemption[];
 };
 
 type LedgerSnapshotV1 = {
@@ -42,20 +47,34 @@ type LedgerSnapshotV2 = {
   completedMissionIds: MissionId[];
 };
 
+type LedgerSnapshotV3 = {
+  version: 3;
+  user: AuthenticatedUser | null;
+  points: number;
+  completedMissionIds: MissionId[];
+  walkMilestoneDay: string | null;
+  creditedWalkMilestones: number[];
+};
+
 export async function loadLedger(): Promise<LedgerSnapshot | null> {
   try {
     const raw = await AsyncStorage.getItem(LEDGER_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as { version?: number };
 
-    if (parsed?.version === 3) {
+    if (parsed?.version === 4) {
       return parsed as LedgerSnapshot;
     }
+    if (parsed?.version === 3) {
+      return migrateV3ToV4(parsed as LedgerSnapshotV3);
+    }
     if (parsed?.version === 2) {
-      return migrateV2ToV3(parsed as LedgerSnapshotV2);
+      return migrateV3ToV4(migrateV2ToV3(parsed as LedgerSnapshotV2));
     }
     if (parsed?.version === 1) {
-      return migrateV2ToV3(migrateV1ToV2(parsed as LedgerSnapshotV1));
+      return migrateV3ToV4(
+        migrateV2ToV3(migrateV1ToV2(parsed as LedgerSnapshotV1)),
+      );
     }
     return null;
   } catch (err) {
@@ -155,7 +174,7 @@ function migrateV1ToV2(old: LedgerSnapshotV1): LedgerSnapshotV2 {
   };
 }
 
-function migrateV2ToV3(old: LedgerSnapshotV2): LedgerSnapshot {
+function migrateV2ToV3(old: LedgerSnapshotV2): LedgerSnapshotV3 {
   // Walk-to-earn fields are entirely new. Defaulting them to "no milestones
   // claimed for any day" means existing users still get the full set of
   // step rewards for the day they first launch the updated app, which is
@@ -167,5 +186,33 @@ function migrateV2ToV3(old: LedgerSnapshotV2): LedgerSnapshot {
     completedMissionIds: old.completedMissionIds,
     walkMilestoneDay: null,
     creditedWalkMilestones: [],
+  };
+}
+
+function migrateV3ToV4(old: LedgerSnapshotV3): LedgerSnapshot {
+  // Seed the transaction log with a single "initial-balance" entry so the
+  // wallet's running total reconciles with `points`. Redemptions start
+  // empty — they're created by user action only.
+  const initial: PointTransaction[] = old.points
+    ? [
+        {
+          id: 'tx_initial_balance',
+          kind: 'initial-balance',
+          delta: old.points,
+          label: 'Starting balance',
+          at: Date.now(),
+        },
+      ]
+    : [];
+
+  return {
+    version: 4,
+    user: old.user,
+    points: old.points,
+    completedMissionIds: old.completedMissionIds,
+    walkMilestoneDay: old.walkMilestoneDay,
+    creditedWalkMilestones: old.creditedWalkMilestones,
+    transactions: initial,
+    redemptions: [],
   };
 }
