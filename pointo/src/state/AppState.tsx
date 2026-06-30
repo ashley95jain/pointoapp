@@ -7,7 +7,11 @@ import React, {
   useRef,
   useState,
 } from 'react';
-import { Platform } from 'react-native';
+import {
+  AppState as RNAppState,
+  Platform,
+  type AppStateStatus,
+} from 'react-native';
 import * as Linking from 'expo-linking';
 import {
   INITIAL_POINTS,
@@ -208,6 +212,36 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     if (authStep.kind !== 'authenticated') return;
     void stepsCounter.start();
   }, [isHydrated, authStep.kind]);
+
+  // Re-seed steps and check for day rollover whenever the app returns to
+  // foreground. Closes two gaps from Phase 2.3:
+  //   1. Steps walked while the app was backgrounded are now picked up
+  //      immediately instead of waiting for the next watchStepCount tick.
+  //   2. If the app sat open across midnight without any step changes,
+  //      the previous day's credited-milestones list is cleared as soon
+  //      as the user returns.
+  useEffect(() => {
+    if (!isHydrated) return;
+    if (authStep.kind !== 'authenticated') return;
+    if (Platform.OS === 'web') return; // no Pedometer / AppState on web
+
+    const handleChange = (status: AppStateStatus) => {
+      if (status !== 'active') return;
+
+      const today = localDayKey();
+      if (walkMilestoneDay !== today) {
+        stepsCounter.resetForNewDay();
+        setWalkMilestoneDay(today);
+        setCreditedWalkMilestones([]);
+        return;
+      }
+
+      void stepsCounter.refreshFromForeground();
+    };
+
+    const subscription = RNAppState.addEventListener('change', handleChange);
+    return () => subscription.remove();
+  }, [isHydrated, authStep.kind, walkMilestoneDay]);
 
   // Credit any milestones the current step count newly crosses.
   useEffect(() => {

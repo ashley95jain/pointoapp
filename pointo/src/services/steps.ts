@@ -141,6 +141,41 @@ class StepsCounter {
   }
 
   /**
+   * Re-seed the historical count from the OS without re-prompting for
+   * permission or restarting the live watcher. Intended to be called when
+   * the app returns to foreground so that steps walked while the app was
+   * backgrounded are picked up immediately instead of waiting for the
+   * next `watchStepCount` callback.
+   *
+   * No-op when the counter hasn't been granted permission yet — start()
+   * should always be the first call.
+   */
+  async refreshFromForeground(): Promise<void> {
+    if (this.state.authorization !== 'granted') return;
+
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    try {
+      const result = await Pedometer.getStepCountAsync(startOfDay, new Date());
+      const next = Math.max(0, Math.round(result.steps ?? 0));
+      // Only adopt the refreshed value when it would increase today's
+      // count. Some Android setups occasionally return 0 here even when
+      // a non-zero seed succeeded earlier; we don't want a transient
+      // failure to visibly rewind the counter.
+      if (next >= this.historicalSteps) {
+        this.historicalSteps = next;
+        // The live watcher's delta is measured against "when start() was
+        // called", so a fresh historical seed makes that delta double-
+        // count. Reset it; the watcher will keep emitting from here.
+        this.liveDelta = 0;
+        this.publishCurrent();
+      }
+    } catch {
+      // Ignore — we'll catch up on the next watch tick.
+    }
+  }
+
+  /**
    * Adds (or subtracts, when amount < 0) steps to the demo offset for use
    * in the iOS Simulator and during development. Has no effect on real
    * device step counts — it only biases the value reported to subscribers.

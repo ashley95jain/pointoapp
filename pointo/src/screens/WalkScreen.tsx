@@ -1,6 +1,7 @@
 import React, { useEffect } from 'react';
 import {
   Alert,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -89,6 +90,14 @@ export function WalkScreen() {
               claimed={credited.has(milestone.steps)}
             />
           ))}
+          {Platform.OS === 'android' &&
+          stepsAuthorization === 'granted' &&
+          todaySteps < 100 ? (
+            <Text style={styles.androidHint}>
+              On Android, Pointo reads steps via Health Connect / Google Fit
+              and may take a few minutes to sync after the first launch.
+            </Text>
+          ) : null}
         </Card>
 
         {__DEV__ ? (
@@ -361,5 +370,11 @@ const styles = StyleSheet.create({
   demoLabel: {
     color: colors.brand,
     fontWeight: '700',
+  },
+  androidHint: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 6,
   },
 });
