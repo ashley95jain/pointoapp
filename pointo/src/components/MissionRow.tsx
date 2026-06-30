@@ -6,14 +6,18 @@ import type { Mission } from '../data/missions';
 type Props = {
   mission: Mission;
   onPress: () => void;
+  disabled?: boolean;
+  actionLabel?: string;
 };
 
-export function MissionRow({ mission, onPress }: Props) {
+export function MissionRow({ mission, onPress, disabled, actionLabel }: Props) {
+  const isDisabled = mission.completed || disabled;
+
   return (
     <Pressable
       onPress={onPress}
-      disabled={mission.completed}
-      style={[styles.row, mission.completed && styles.rowCompleted]}
+      disabled={isDisabled}
+      style={[styles.row, mission.completed && styles.rowCompleted, disabled && styles.rowDisabled]}
     >
       <View style={styles.details}>
         <Text style={styles.title}>{mission.title}</Text>
@@ -22,7 +26,7 @@ export function MissionRow({ mission, onPress }: Props) {
       <View style={styles.badge}>
         <Text style={styles.badgeValue}>+{mission.points}</Text>
         <Text style={styles.badgeStatus}>
-          {mission.completed ? 'Claimed' : 'Claim'}
+          {mission.completed ? 'Claimed' : actionLabel ?? 'Claim'}
         </Text>
       </View>
     </Pressable>
@@ -44,6 +48,9 @@ const styles = StyleSheet.create({
   rowCompleted: {
     backgroundColor: colors.successBg,
     borderColor: colors.success,
+  },
+  rowDisabled: {
+    opacity: 0.7,
   },
   details: {
     flex: 1,
