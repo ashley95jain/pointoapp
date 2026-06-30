@@ -1,31 +1,20 @@
 # Pointo
 
-Pointo is a Japan-focused rewards app concept. Users sign in, join through a
-referral link, and earn points for installs, walk-based challenges, and friend
-invitations.
-
-This repository contains two implementations:
-
-| Folder         | Stack              | Status            |
-| -------------- | ------------------ | ----------------- |
-| `pointo-ios/`  | **Native SwiftUI** | Primary iOS app   |
-| `pointo/`      | Expo / React Native | Early prototype   |
+Pointo is an iOS-friendly rewards app concept for users in Japan. Users can sign in, join through a referral link, and earn points by installing the app, completing walk-based challenges, and inviting friends.
 
 ## Features
-- Phone-number login with a 6-digit one-time-password flow
-- Referral-based invitation flow with Universal Links (`https://pointo.app/join/<CODE>`)
+- Simple login experience
+- Referral-based invitation flow
 - Point rewards for app installation
-- Walk-and-earn missions powered by `CMPedometer`
-- Reward catalogue tailored to Japan (Amazon JP, Starbucks JP, PayPay, Rakuten, dPoint, 7-Eleven, UNICEF donation)
+- Walk-and-earn missions
+- Friend referral rewards
 
-## Run the native iOS app
-```bash
-open pointo-ios/Pointo.xcodeproj
-```
-Pick the **Pointo** scheme and run on a Simulator or device. See
-[`pointo-ios/README.md`](pointo-ios/README.md) for full details.
+## Project structure
+- Expo-based React Native app in the pointo folder
+- Main app experience in pointo/App.tsx
+- App configuration in pointo/app.json
 
-## Run the Expo prototype (optional)
+## Run locally
 ```bash
 cd pointo
 npm install
@@ -33,6 +22,4 @@ npm run ios
 ```
 
 ## Notes
-The native app is the recommended starting point. It is structured for easy
-extension toward a real backend (auth provider, server-side ledger,
-HealthKit-corroborated step verification, etc.).
+This project is a starter concept for a referral-based points app and can be extended with authentication, backend services, and real reward tracking.
