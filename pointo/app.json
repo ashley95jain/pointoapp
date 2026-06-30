@@ -10,7 +10,10 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.pointo.app",
-      "associatedDomains": ["applinks:pointo.app"]
+      "associatedDomains": ["applinks:pointo.app"],
+      "infoPlist": {
+        "NSMotionUsageDescription": "Pointo uses your step count to award walk-to-earn rewards."
+      }
     },
     "android": {
       "package": "com.pointo.app",
@@ -21,6 +24,9 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.ACTIVITY_RECOGNITION"
+      ],
       "intentFilters": [
         {
           "action": "VIEW",
