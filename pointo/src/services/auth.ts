@@ -203,14 +203,16 @@ export function stableUserId(normalizedPhone: string): string {
   return `usr_${hash.toString(36)}`;
 }
 
-function rejectionFor(kind: AuthError['kind']): Error {
+function rejectionFor(kind: AuthError['kind'], override?: string): Error {
   const messages: Record<AuthError['kind'], string> = {
     invalidPhone: 'That phone number does not look valid.',
     invalidCode: 'The verification code did not match.',
     expired: 'Verification code expired. Please request a new one.',
     rateLimited: 'Too many attempts. Please wait a moment and try again.',
   };
-  const err = new Error(messages[kind]) as Error & { authKind: AuthError['kind'] };
+  const err = new Error(override ?? messages[kind]) as Error & {
+    authKind: AuthError['kind'];
+  };
   err.authKind = kind;
   return err;
 }
@@ -223,8 +225,172 @@ export function authErrorKind(err: unknown): AuthError['kind'] | null {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP provider
+// ---------------------------------------------------------------------------
+
+/**
+ * Configuration for `HttpAuthProvider`. Endpoints are resolved relative to
+ * `baseUrl`, so a base of `https://auth.pointo.app` will hit
+ * `https://auth.pointo.app/v1/auth/request-code` etc.
+ *
+ * The provider expects the following contract from the backend (any
+ * implementation that satisfies it — Firebase Functions, Supabase Edge,
+ * AWS Lambda, custom Express, KDDI Message Cast wrapper — works):
+ *
+ *   POST /v1/auth/request-code
+ *     body:  { phone: string }
+ *     200:   { verificationId: string, expiresAt?: number }
+ *     4xx:   { error: { kind: AuthError['kind'], message: string } }
+ *
+ *   POST /v1/auth/verify-code
+ *     body:  { verificationId: string, code: string, displayName: string }
+ *     200:   { token: string, user: AuthenticatedUser }
+ *     4xx:   { error: { kind: AuthError['kind'], message: string } }
+ */
+export type HttpAuthConfig = {
+  baseUrl: string;
+  /** Per-request timeout. Defaults to 15s. */
+  timeoutMs?: number;
+  /** Extra headers injected on every call (e.g. `x-app-version`). */
+  defaultHeaders?: Record<string, string>;
+};
+
+export class HttpAuthProvider implements AuthProvider {
+  private readonly baseUrl: string;
+  private readonly timeoutMs: number;
+  private readonly defaultHeaders: Record<string, string>;
+
+  constructor(config: HttpAuthConfig) {
+    if (!config.baseUrl) {
+      throw new Error('HttpAuthProvider: baseUrl is required.');
+    }
+    this.baseUrl = config.baseUrl.replace(/\/+$/, '');
+    this.timeoutMs = config.timeoutMs ?? 15_000;
+    this.defaultHeaders = config.defaultHeaders ?? {};
+  }
+
+  async requestCode(phone: string): Promise<RequestCodeResult> {
+    if (!isValidJapanesePhone(phone)) {
+      throw rejectionFor('invalidPhone');
+    }
+    const normalized = normalizeJapanesePhone(phone);
+    const data = await this.post<{ verificationId: string }>(
+      '/v1/auth/request-code',
+      { phone: normalized },
+    );
+    return { verificationId: data.verificationId };
+  }
+
+  async verifyCode(input: {
+    verificationId: string;
+    code: string;
+    displayName: string;
+  }): Promise<VerifyCodeResult> {
+    const data = await this.post<{ token: string; user: AuthenticatedUser }>(
+      '/v1/auth/verify-code',
+      {
+        verificationId: input.verificationId,
+        code: input.code.replace(/\D/g, ''),
+        displayName: input.displayName.trim(),
+      },
+    );
+    return data;
+  }
+
+  private async post<T>(path: string, body: unknown): Promise<T> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          ...this.defaultHeaders,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (err && typeof err === 'object' && (err as { name?: string }).name === 'AbortError') {
+        throw new Error('Network timeout. Please check your connection and retry.');
+      }
+      throw new Error('Network error. Please check your connection and retry.');
+    } finally {
+      clearTimeout(timer);
+    }
+
+    let parsed: unknown = null;
+    try {
+      parsed = await response.json();
+    } catch {
+      // Body may be empty / non-JSON on errors. Fall through.
+    }
+
+    if (!response.ok) {
+      const errPayload = (parsed as { error?: { kind?: string; message?: string } })?.error;
+      const kind = errPayload?.kind;
+      if (kind && isAuthErrorKind(kind)) {
+        throw rejectionFor(kind, errPayload?.message);
+      }
+      if (response.status === 429) throw rejectionFor('rateLimited');
+      if (response.status >= 500) {
+        throw new Error('The login service is temporarily unavailable. Please retry shortly.');
+      }
+      throw new Error(errPayload?.message ?? `Login failed (HTTP ${response.status}).`);
+    }
+
+    return parsed as T;
+  }
+}
+
+function isAuthErrorKind(value: string): value is AuthError['kind'] {
+  return value === 'invalidPhone' || value === 'invalidCode' || value === 'expired' || value === 'rateLimited';
+}
+
+// ---------------------------------------------------------------------------
 // Wired-up singleton
 // ---------------------------------------------------------------------------
 
-/** Active provider. Swap with a real implementation in production. */
-export const authProvider: AuthProvider = new MockAuthProvider();
+/**
+ * Selects an auth provider at module-load time:
+ *
+ *   1. If `EXPO_PUBLIC_AUTH_PROVIDER === 'http'`, build an `HttpAuthProvider`
+ *      from `EXPO_PUBLIC_AUTH_API_URL` (required in that mode).
+ *   2. If `EXPO_PUBLIC_AUTH_API_URL` is set without an explicit provider
+ *      hint, default to `'http'`.
+ *   3. Otherwise fall back to the `MockAuthProvider` so local development
+ *      keeps working with the universal `000000` code.
+ *
+ * The Expo bundler inlines any env var prefixed with `EXPO_PUBLIC_`, so
+ * setting these in `.env` / `eas.json` is enough — no app-config changes
+ * required.
+ */
+function resolveAuthProvider(): AuthProvider {
+  const explicit = process.env.EXPO_PUBLIC_AUTH_PROVIDER;
+  const baseUrl = process.env.EXPO_PUBLIC_AUTH_API_URL;
+
+  if (explicit === 'mock') return new MockAuthProvider();
+
+  if (explicit === 'http' || (!explicit && baseUrl)) {
+    if (!baseUrl) {
+      if (__DEV__) {
+        console.warn(
+          '[pointo] EXPO_PUBLIC_AUTH_PROVIDER=http but EXPO_PUBLIC_AUTH_API_URL is missing — falling back to mock.',
+        );
+      }
+      return new MockAuthProvider();
+    }
+    return new HttpAuthProvider({ baseUrl });
+  }
+
+  return new MockAuthProvider();
+}
+
+export const authProvider: AuthProvider = resolveAuthProvider();
+
+/** Exposed for diagnostics — used by the LoginScreen's demo hint. */
+export function isUsingMockAuth(): boolean {
+  return authProvider instanceof MockAuthProvider;
+}
