@@ -26,6 +26,13 @@ import {
   REFERRAL_INSTALL_REWARD,
 } from '../services/referral';
 import {
+  localDayKey,
+  newlyCrossedMilestones,
+  stepsCounter,
+  WALK_MISSION_COMPLETION_STEPS,
+  type StepsAuthorization,
+} from '../services/steps';
+import {
   clearAuthToken,
   clearLedger,
   loadAuthToken,
@@ -46,6 +53,12 @@ export type ReferralRedemption = {
   at: number;
 };
 
+export type WalkMilestoneEvent = {
+  steps: number;
+  pointsCredited: number;
+  at: number;
+};
+
 type AppStateValue = {
   isHydrated: boolean;
   authStep: AuthStep;
@@ -56,6 +69,11 @@ type AppStateValue = {
   referralUrl: string;
   completedCount: number;
   lastReferralRedemption: ReferralRedemption | null;
+
+  todaySteps: number;
+  stepsAuthorization: StepsAuthorization;
+  creditedWalkMilestones: ReadonlyArray<number>;
+  lastWalkMilestone: WalkMilestoneEvent | null;
 
   requestCode: (phone: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
   verifyCode: (
@@ -73,6 +91,11 @@ type AppStateValue = {
    */
   handleIncomingUrl: (url: string) => Promise<ReferralRedemption | null>;
   acknowledgeReferralRedemption: () => void;
+
+  startStepTracking: () => Promise<void>;
+  injectDemoSteps: (amount: number) => void;
+  resetDemoSteps: () => void;
+  acknowledgeWalkMilestone: () => void;
 };
 
 const AppStateContext = createContext<AppStateValue | undefined>(undefined);
@@ -85,6 +108,14 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
   const [missions, setMissions] = useState<Mission[]>(initialMissions);
   const [lastReferralRedemption, setLastReferralRedemption] =
     useState<ReferralRedemption | null>(null);
+
+  const [todaySteps, setTodaySteps] = useState(0);
+  const [stepsAuthorization, setStepsAuthorization] =
+    useState<StepsAuthorization>('unknown');
+  const [walkMilestoneDay, setWalkMilestoneDay] = useState<string | null>(null);
+  const [creditedWalkMilestones, setCreditedWalkMilestones] = useState<number[]>([]);
+  const [lastWalkMilestone, setLastWalkMilestone] =
+    useState<WalkMilestoneEvent | null>(null);
 
   const hasHydratedRef = useRef(false);
 
@@ -119,6 +150,20 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
         setMissions(
           initialMissions.map((m) => ({ ...m, completed: completedSet.has(m.id) })),
         );
+
+        // Daily milestone reset: if the persisted day key doesn't match
+        // today we drop the credited-milestone list so a new set of
+        // step rewards can be earned.
+        const today = localDayKey();
+        if (snapshot.walkMilestoneDay === today) {
+          setWalkMilestoneDay(today);
+          setCreditedWalkMilestones(snapshot.creditedWalkMilestones);
+        } else {
+          setWalkMilestoneDay(today);
+          setCreditedWalkMilestones([]);
+        }
+      } else {
+        setWalkMilestoneDay(localDayKey());
       }
 
       hasHydratedRef.current = true;
@@ -136,13 +181,76 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!hasHydratedRef.current) return;
     const snapshot: LedgerSnapshot = {
-      version: 2,
+      version: 3,
       user,
       points,
       completedMissionIds: missions.filter((m) => m.completed).map((m) => m.id),
+      walkMilestoneDay,
+      creditedWalkMilestones,
     };
     void saveLedger(snapshot);
-  }, [user, points, missions]);
+  }, [user, points, missions, walkMilestoneDay, creditedWalkMilestones]);
+
+  // ---------------------------------------------------------------------
+  // Step tracking
+  // ---------------------------------------------------------------------
+  useEffect(() => {
+    const unsubscribe = stepsCounter.subscribe((state) => {
+      setStepsAuthorization(state.authorization);
+      setTodaySteps(state.todaySteps);
+    });
+    return unsubscribe;
+  }, []);
+
+  // Auto-start the watcher for authenticated sessions once hydrated.
+  useEffect(() => {
+    if (!isHydrated) return;
+    if (authStep.kind !== 'authenticated') return;
+    void stepsCounter.start();
+  }, [isHydrated, authStep.kind]);
+
+  // Credit any milestones the current step count newly crosses.
+  useEffect(() => {
+    if (!isHydrated) return;
+    if (authStep.kind !== 'authenticated') return;
+
+    // Daily-rollover detection driven by the steps update tick.
+    const today = localDayKey();
+    if (walkMilestoneDay !== today) {
+      stepsCounter.resetForNewDay();
+      setWalkMilestoneDay(today);
+      setCreditedWalkMilestones([]);
+      return;
+    }
+
+    const credited = new Set(creditedWalkMilestones);
+    const newlyCrossed = newlyCrossedMilestones(todaySteps, credited);
+    if (newlyCrossed.length === 0) return;
+
+    const lastNew = newlyCrossed[newlyCrossed.length - 1];
+    const totalNewReward = newlyCrossed.reduce((acc, m) => acc + m.reward, 0);
+
+    setPoints((current) => current + totalNewReward);
+    setCreditedWalkMilestones([...credited, ...newlyCrossed.map((m) => m.steps)]);
+    setLastWalkMilestone({
+      steps: lastNew.steps,
+      pointsCredited: totalNewReward,
+      at: Date.now(),
+    });
+
+    // Cross the 'walk' mission as complete once the daily goal is hit.
+    if (todaySteps >= WALK_MISSION_COMPLETION_STEPS) {
+      setMissions((current) =>
+        current.map((m) => (m.id === 'walk' ? { ...m, completed: true } : m)),
+      );
+    }
+  }, [
+    isHydrated,
+    authStep.kind,
+    todaySteps,
+    walkMilestoneDay,
+    creditedWalkMilestones,
+  ]);
 
   // ---------------------------------------------------------------------
   // Deep-link / referral ingestion
@@ -259,7 +367,30 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     setAuthStep({ kind: 'idle' });
     setMissions(initialMissions);
     setPoints(INITIAL_POINTS);
+    setCreditedWalkMilestones([]);
+    setLastWalkMilestone(null);
+    stepsCounter.stop();
+    stepsCounter.resetDemoSteps();
     await Promise.all([clearAuthToken(), clearLedger()]);
+  }, []);
+
+  // ---------------------------------------------------------------------
+  // Step-tracking actions
+  // ---------------------------------------------------------------------
+  const startStepTracking = useCallback(async () => {
+    await stepsCounter.start();
+  }, []);
+
+  const injectDemoSteps = useCallback((amount: number) => {
+    stepsCounter.injectDemoSteps(amount);
+  }, []);
+
+  const resetDemoSteps = useCallback(() => {
+    stepsCounter.resetDemoSteps();
+  }, []);
+
+  const acknowledgeWalkMilestone = useCallback(() => {
+    setLastWalkMilestone(null);
   }, []);
 
   // ---------------------------------------------------------------------
@@ -295,6 +426,10 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       referralUrl,
       completedCount,
       lastReferralRedemption,
+      todaySteps,
+      stepsAuthorization,
+      creditedWalkMilestones,
+      lastWalkMilestone,
       requestCode,
       verifyCode,
       cancelCodeEntry,
@@ -302,6 +437,10 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       claimMission,
       handleIncomingUrl,
       acknowledgeReferralRedemption,
+      startStepTracking,
+      injectDemoSteps,
+      resetDemoSteps,
+      acknowledgeWalkMilestone,
     }),
     [
       isHydrated,
@@ -313,6 +452,10 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       referralUrl,
       completedCount,
       lastReferralRedemption,
+      todaySteps,
+      stepsAuthorization,
+      creditedWalkMilestones,
+      lastWalkMilestone,
       requestCode,
       verifyCode,
       cancelCodeEntry,
@@ -320,6 +463,10 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       claimMission,
       handleIncomingUrl,
       acknowledgeReferralRedemption,
+      startStepTracking,
+      injectDemoSteps,
+      resetDemoSteps,
+      acknowledgeWalkMilestone,
     ],
   );
 

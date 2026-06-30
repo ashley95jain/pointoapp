@@ -15,12 +15,15 @@ const TOKEN_WEB_FALLBACK_KEY = 'pointo:authToken:webFallback';
  *
  * v1 (Phase 1.2): { isLoggedIn, name, phone, points, completedMissionIds }
  * v2 (Phase 2.1): { user | null, points, completedMissionIds }
+ * v3 (Phase 2.3): + { walkMilestoneDay, creditedWalkMilestones }
  */
 export type LedgerSnapshot = {
-  version: 2;
+  version: 3;
   user: AuthenticatedUser | null;
   points: number;
   completedMissionIds: MissionId[];
+  walkMilestoneDay: string | null;
+  creditedWalkMilestones: number[];
 };
 
 type LedgerSnapshotV1 = {
@@ -32,17 +35,27 @@ type LedgerSnapshotV1 = {
   completedMissionIds: MissionId[];
 };
 
+type LedgerSnapshotV2 = {
+  version: 2;
+  user: AuthenticatedUser | null;
+  points: number;
+  completedMissionIds: MissionId[];
+};
+
 export async function loadLedger(): Promise<LedgerSnapshot | null> {
   try {
     const raw = await AsyncStorage.getItem(LEDGER_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as { version?: number };
 
-    if (parsed?.version === 2) {
+    if (parsed?.version === 3) {
       return parsed as LedgerSnapshot;
     }
+    if (parsed?.version === 2) {
+      return migrateV2ToV3(parsed as LedgerSnapshotV2);
+    }
     if (parsed?.version === 1) {
-      return migrateV1ToV2(parsed as LedgerSnapshotV1);
+      return migrateV2ToV3(migrateV1ToV2(parsed as LedgerSnapshotV1));
     }
     return null;
   } catch (err) {
@@ -115,7 +128,7 @@ export async function clearAuthToken(): Promise<void> {
 // Migrations
 // ---------------------------------------------------------------------------
 
-function migrateV1ToV2(old: LedgerSnapshotV1): LedgerSnapshot {
+function migrateV1ToV2(old: LedgerSnapshotV1): LedgerSnapshotV2 {
   // v1 stored the user implicitly via `isLoggedIn + name + phone`. Promote
   // it to a structured AuthenticatedUser so the rest of the app can treat
   // resumed sessions identically to freshly-authenticated ones.
@@ -139,5 +152,20 @@ function migrateV1ToV2(old: LedgerSnapshotV1): LedgerSnapshot {
     },
     points: old.points,
     completedMissionIds: old.completedMissionIds,
+  };
+}
+
+function migrateV2ToV3(old: LedgerSnapshotV2): LedgerSnapshot {
+  // Walk-to-earn fields are entirely new. Defaulting them to "no milestones
+  // claimed for any day" means existing users still get the full set of
+  // step rewards for the day they first launch the updated app, which is
+  // the desired UX.
+  return {
+    version: 3,
+    user: old.user,
+    points: old.points,
+    completedMissionIds: old.completedMissionIds,
+    walkMilestoneDay: null,
+    creditedWalkMilestones: [],
   };
 }
