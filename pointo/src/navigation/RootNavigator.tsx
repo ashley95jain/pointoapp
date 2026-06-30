@@ -32,12 +32,13 @@ const pointoTheme: Theme = {
 };
 
 export function RootNavigator() {
-  const { isLoggedIn } = useAppState();
+  const { authStep } = useAppState();
+  const isAuthenticated = authStep.kind === 'authenticated';
 
   return (
     <NavigationContainer theme={pointoTheme}>
       <Stack.Navigator screenOptions={{ headerShown: false }}>
-        {isLoggedIn ? (
+        {isAuthenticated ? (
           <Stack.Screen name="Main" component={MainTabs} />
         ) : (
           <Stack.Screen name="Login" component={LoginScreen} />

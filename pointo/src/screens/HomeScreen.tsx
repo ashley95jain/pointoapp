@@ -16,7 +16,8 @@ import { colors } from '../theme/colors';
 import { useAppState } from '../state/AppState';
 
 export function HomeScreen() {
-  const { name, points, missions, completedCount, claimMission, logout } = useAppState();
+  const { user, points, missions, completedCount, claimMission, logout } = useAppState();
+  const displayName = user?.displayName ?? 'Pointo会員';
 
   const handleMissionPress = (id: typeof missions[number]['id']) => {
     const claimed = claimMission(id);
@@ -30,7 +31,7 @@ export function HomeScreen() {
       <StatusBar style="dark" />
       <ScrollView contentContainerStyle={styles.container}>
         <BrandHeader
-          title={`Hi, ${name.split(' ')[0]}`}
+          title={`Hi, ${displayName.split(' ')[0]}`}
           subtitle="Earn rewards every day by completing missions, walking, and inviting friends."
         />
 
