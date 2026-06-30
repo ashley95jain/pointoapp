@@ -2,6 +2,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 import type { MissionId } from '../data/missions';
+import { stableUserId, type AuthenticatedUser } from '../services/auth';
 
 const LEDGER_KEY = 'pointo:ledger:v1';
 const TOKEN_KEY = 'pointo.authToken';
@@ -9,9 +10,20 @@ const TOKEN_WEB_FALLBACK_KEY = 'pointo:authToken:webFallback';
 
 /**
  * Versioned snapshot of all non-secret state persisted across launches.
- * `version` is reserved for future migrations.
+ * The `version` field exists so structural changes can run a migration
+ * without bricking installed sessions.
+ *
+ * v1 (Phase 1.2): { isLoggedIn, name, phone, points, completedMissionIds }
+ * v2 (Phase 2.1): { user | null, points, completedMissionIds }
  */
 export type LedgerSnapshot = {
+  version: 2;
+  user: AuthenticatedUser | null;
+  points: number;
+  completedMissionIds: MissionId[];
+};
+
+type LedgerSnapshotV1 = {
   version: 1;
   isLoggedIn: boolean;
   name: string;
@@ -24,9 +36,15 @@ export async function loadLedger(): Promise<LedgerSnapshot | null> {
   try {
     const raw = await AsyncStorage.getItem(LEDGER_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<LedgerSnapshot>;
-    if (parsed?.version !== 1) return null;
-    return parsed as LedgerSnapshot;
+    const parsed = JSON.parse(raw) as { version?: number };
+
+    if (parsed?.version === 2) {
+      return parsed as LedgerSnapshot;
+    }
+    if (parsed?.version === 1) {
+      return migrateV1ToV2(parsed as LedgerSnapshotV1);
+    }
+    return null;
   } catch (err) {
     if (__DEV__) console.warn('[pointo] loadLedger failed', err);
     return null;
@@ -91,4 +109,35 @@ export async function clearAuthToken(): Promise<void> {
   } catch (err) {
     if (__DEV__) console.warn('[pointo] clearAuthToken failed', err);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Migrations
+// ---------------------------------------------------------------------------
+
+function migrateV1ToV2(old: LedgerSnapshotV1): LedgerSnapshot {
+  // v1 stored the user implicitly via `isLoggedIn + name + phone`. Promote
+  // it to a structured AuthenticatedUser so the rest of the app can treat
+  // resumed sessions identically to freshly-authenticated ones.
+  if (!old.isLoggedIn) {
+    return {
+      version: 2,
+      user: null,
+      points: old.points,
+      completedMissionIds: old.completedMissionIds,
+    };
+  }
+
+  const id = stableUserId(old.phone);
+  return {
+    version: 2,
+    user: {
+      id,
+      phone: old.phone,
+      displayName: old.name,
+      joinedAt: new Date(0).toISOString(),
+    },
+    points: old.points,
+    completedMissionIds: old.completedMissionIds,
+  };
 }

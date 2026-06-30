@@ -9,12 +9,16 @@ import React, {
 } from 'react';
 import { Platform } from 'react-native';
 import {
-  DEFAULT_REFERRAL_CODE,
   INITIAL_POINTS,
   initialMissions,
   type Mission,
   type MissionId,
 } from '../data/missions';
+import {
+  authProvider,
+  referralCodeForUserId,
+  type AuthenticatedUser,
+} from '../services/auth';
 import {
   clearAuthToken,
   clearLedger,
@@ -25,53 +29,54 @@ import {
   type LedgerSnapshot,
 } from './storage';
 
-type AuthFormState = {
-  name: string;
-  phone: string;
-};
+export type AuthStep =
+  | { kind: 'idle' }
+  | { kind: 'awaiting-code'; phone: string; verificationId: string; demoCode?: string }
+  | { kind: 'authenticated' };
 
 type AppStateValue = {
   isHydrated: boolean;
-  isLoggedIn: boolean;
-  name: string;
-  phone: string;
+  authStep: AuthStep;
+  user: AuthenticatedUser | null;
   points: number;
   missions: Mission[];
   referralCode: string;
   referralUrl: string;
   completedCount: number;
 
-  setName: (name: string) => void;
-  setPhone: (phone: string) => void;
-  login: (form: AuthFormState) => { ok: true } | { ok: false; reason: string };
+  requestCode: (phone: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  verifyCode: (
+    code: string,
+    displayName: string,
+  ) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  cancelCodeEntry: () => void;
   logout: () => Promise<void>;
   claimMission: (id: MissionId) => Mission | undefined;
 };
 
 const AppStateContext = createContext<AppStateValue | undefined>(undefined);
 
-const DEFAULT_NAME = 'Aiko';
-const DEFAULT_PHONE = '080-1234-5678';
-
 export function AppStateProvider({ children }: { children: React.ReactNode }) {
   const [isHydrated, setIsHydrated] = useState(false);
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [name, setName] = useState(DEFAULT_NAME);
-  const [phone, setPhone] = useState(DEFAULT_PHONE);
+  const [authStep, setAuthStep] = useState<AuthStep>({ kind: 'idle' });
+  const [user, setUser] = useState<AuthenticatedUser | null>(null);
   const [points, setPoints] = useState(INITIAL_POINTS);
   const [missions, setMissions] = useState<Mission[]>(initialMissions);
 
-  /**
-   * Tracks whether the very first hydration pass has finished so we don't
-   * accidentally overwrite the persisted snapshot with the in-memory
-   * defaults on the first render pass.
-   */
   const hasHydratedRef = useRef(false);
 
-  const referralCode = DEFAULT_REFERRAL_CODE;
-  const referralUrl = `https://pointo.app/join/${referralCode}`;
+  const referralCode = useMemo(
+    () => (user ? referralCodeForUserId(user.id) : 'PT-WELCOME'),
+    [user],
+  );
+  const referralUrl = useMemo(
+    () => `https://pointo.app/join/${referralCode}`,
+    [referralCode],
+  );
 
-  // Hydrate once on mount.
+  // ---------------------------------------------------------------------
+  // Hydration
+  // ---------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -79,18 +84,14 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       if (cancelled) return;
 
       if (snapshot) {
-        // An existing token is required to consider the session "logged in"
-        // — this lets Phase 2.1 invalidate sessions just by clearing the
-        // token without having to also rewrite the ledger. On web,
-        // SecureStore is unavailable so the token may be null even when the
-        // user is logged in; trust the snapshot flag in that case.
-        const sessionStillValid =
-          snapshot.isLoggedIn && (Platform.OS === 'web' || !!token);
-        setIsLoggedIn(sessionStillValid);
-        setName(snapshot.name);
-        setPhone(snapshot.phone);
+        // A session is only restored when both the user record and an auth
+        // token are present. On web, SecureStore is unavailable so we trust
+        // the user record alone.
+        const sessionValid =
+          !!snapshot.user && (Platform.OS === 'web' || !!token);
+        setUser(sessionValid ? snapshot.user : null);
+        setAuthStep(sessionValid ? { kind: 'authenticated' } : { kind: 'idle' });
         setPoints(snapshot.points);
-
         const completedSet = new Set(snapshot.completedMissionIds);
         setMissions(
           initialMissions.map((m) => ({ ...m, completed: completedSet.has(m.id) })),
@@ -106,45 +107,81 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  // Persist on every change to ledger-relevant state, but only after the
-  // first hydration pass has completed.
+  // ---------------------------------------------------------------------
+  // Persistence — only after the first hydration pass.
+  // ---------------------------------------------------------------------
   useEffect(() => {
     if (!hasHydratedRef.current) return;
     const snapshot: LedgerSnapshot = {
-      version: 1,
-      isLoggedIn,
-      name,
-      phone,
+      version: 2,
+      user,
       points,
       completedMissionIds: missions.filter((m) => m.completed).map((m) => m.id),
     };
-    // saveLedger is fire-and-forget; we don't need to await it from a hook.
     void saveLedger(snapshot);
-  }, [isLoggedIn, name, phone, points, missions]);
+  }, [user, points, missions]);
 
-  const login = useCallback(
-    (form: AuthFormState): { ok: true } | { ok: false; reason: string } => {
-      if (!form.name.trim() || !form.phone.trim()) {
-        return { ok: false, reason: 'Please enter your name and phone number to continue.' };
+  // ---------------------------------------------------------------------
+  // Auth flow
+  // ---------------------------------------------------------------------
+  const requestCode = useCallback(
+    async (phone: string): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      try {
+        const result = await authProvider.requestCode(phone);
+        setAuthStep({
+          kind: 'awaiting-code',
+          phone,
+          verificationId: result.verificationId,
+          demoCode: result.demoCode,
+        });
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, reason: errorMessage(err) };
       }
-      setName(form.name);
-      setPhone(form.phone);
-      setIsLoggedIn(true);
-      // Placeholder token. Phase 2.1 swaps this for a real token returned
-      // by the SMS provider after OTP verification.
-      void saveAuthToken('pointo-dev-session');
-      return { ok: true };
     },
     [],
   );
 
+  const verifyCode = useCallback(
+    async (
+      code: string,
+      displayName: string,
+    ): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      if (authStep.kind !== 'awaiting-code') {
+        return { ok: false, reason: 'No verification in progress.' };
+      }
+      try {
+        const result = await authProvider.verifyCode({
+          verificationId: authStep.verificationId,
+          code,
+          displayName,
+        });
+        await saveAuthToken(result.token);
+        setUser(result.user);
+        setAuthStep({ kind: 'authenticated' });
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, reason: errorMessage(err) };
+      }
+    },
+    [authStep],
+  );
+
+  const cancelCodeEntry = useCallback(() => {
+    setAuthStep({ kind: 'idle' });
+  }, []);
+
   const logout = useCallback(async () => {
-    setIsLoggedIn(false);
+    setUser(null);
+    setAuthStep({ kind: 'idle' });
     setMissions(initialMissions);
     setPoints(INITIAL_POINTS);
     await Promise.all([clearAuthToken(), clearLedger()]);
   }, []);
 
+  // ---------------------------------------------------------------------
+  // Missions
+  // ---------------------------------------------------------------------
   const claimMission = useCallback(
     (id: MissionId): Mission | undefined => {
       const mission = missions.find((m) => m.id === id);
@@ -167,31 +204,31 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo<AppStateValue>(
     () => ({
       isHydrated,
-      isLoggedIn,
-      name,
-      phone,
+      authStep,
+      user,
       points,
       missions,
       referralCode,
       referralUrl,
       completedCount,
-      setName,
-      setPhone,
-      login,
+      requestCode,
+      verifyCode,
+      cancelCodeEntry,
       logout,
       claimMission,
     }),
     [
       isHydrated,
-      isLoggedIn,
-      name,
-      phone,
+      authStep,
+      user,
       points,
       missions,
       referralCode,
       referralUrl,
       completedCount,
-      login,
+      requestCode,
+      verifyCode,
+      cancelCodeEntry,
       logout,
       claimMission,
     ],
@@ -206,4 +243,9 @@ export function useAppState(): AppStateValue {
     throw new Error('useAppState must be called inside <AppStateProvider>');
   }
   return ctx;
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
 }
