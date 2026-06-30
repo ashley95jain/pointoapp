@@ -16,12 +16,25 @@ import { colors } from '../theme/colors';
 import { useAppState } from '../state/AppState';
 
 export function HomeScreen() {
-  const { name, points, missions, completedCount, claimMission, logout } = useAppState();
+  const {
+    name,
+    points,
+    missions,
+    completedCount,
+    claimingMissionId,
+    claimMission,
+    logout,
+  } = useAppState();
 
-  const handleMissionPress = (id: typeof missions[number]['id']) => {
-    const claimed = claimMission(id);
-    if (claimed) {
-      Alert.alert('Mission claimed', `${claimed.points} points added to your wallet.`);
+  const handleMissionPress = async (id: typeof missions[number]['id']) => {
+    try {
+      const claimed = await claimMission(id);
+      if (claimed) {
+        Alert.alert('Mission claimed', `${claimed.points} points added to your wallet.`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Please try again.';
+      Alert.alert('Mission not claimed', message);
     }
   };
 
@@ -47,6 +60,8 @@ export function HomeScreen() {
               key={mission.id}
               mission={mission}
               onPress={() => handleMissionPress(mission.id)}
+              disabled={claimingMissionId === mission.id}
+              actionLabel={claimingMissionId === mission.id ? 'Claiming' : undefined}
             />
           ))}
         </Card>

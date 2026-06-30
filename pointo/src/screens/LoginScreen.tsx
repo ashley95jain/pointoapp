@@ -17,12 +17,12 @@ import { colors, radii } from '../theme/colors';
 import { useAppState } from '../state/AppState';
 
 export function LoginScreen() {
-  const { name: storedName, phone: storedPhone, login } = useAppState();
+  const { name: storedName, phone: storedPhone, isLoading, login } = useAppState();
   const [name, setName] = useState(storedName);
   const [phone, setPhone] = useState(storedPhone);
 
-  const handleLogin = () => {
-    const result = login({ name, phone });
+  const handleLogin = async () => {
+    const result = await login({ name, phone });
     if (!result.ok) {
       Alert.alert('Login needed', result.reason);
       return;
@@ -73,7 +73,11 @@ export function LoginScreen() {
               placeholderTextColor={colors.textTertiary}
             />
 
-            <PrimaryButton label="Continue to Pointo" onPress={handleLogin} />
+            <PrimaryButton
+              label={isLoading ? 'Connecting...' : 'Continue to Pointo'}
+              onPress={handleLogin}
+              disabled={isLoading}
+            />
           </Card>
         </ScrollView>
       </KeyboardAvoidingView>

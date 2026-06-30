@@ -1,4 +1,4 @@
-export type MissionId = 'install' | 'walk' | 'invite';
+export type MissionId = string;
 
 export type Mission = {
   id: MissionId;
