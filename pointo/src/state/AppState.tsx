@@ -43,6 +43,22 @@ import {
   saveOutbox,
 } from '../services/ledgerOutbox';
 import {
+  cancelAllReminders,
+  cancelReminder,
+  fireLocalNotification,
+  getExpoPushToken,
+  getPermission as getNotificationPermission,
+  requestPermission as requestNotificationPermission,
+  scheduleDailyReminder,
+  type NotificationPermission,
+} from '../services/notifications';
+import {
+  clearNotificationPrefs,
+  loadNotificationPrefs,
+  saveNotificationPrefs,
+} from '../services/notificationPrefs';
+import Constants from 'expo-constants';
+import {
   parseReferralUrl,
   tryRedeemReferralCode,
   REFERRAL_INSTALL_REWARD,
@@ -91,6 +107,18 @@ export type LedgerSyncStatus =
   | { kind: 'ok'; at: number }
   | { kind: 'error'; at: number; reason: string };
 
+export type NotificationPrefs = {
+  walkEveningReminder: boolean;
+  streakMorningReminder: boolean;
+  rewardAlerts: boolean;
+};
+
+const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
+  walkEveningReminder: true,
+  streakMorningReminder: false,
+  rewardAlerts: true,
+};
+
 type AppStateValue = {
   isHydrated: boolean;
   authStep: AuthStep;
@@ -119,6 +147,12 @@ type AppStateValue = {
   outboxSize: number;
   flushLedger: () => Promise<void>;
   pullLedger: () => Promise<{ ok: true } | { ok: false; reason: string }>;
+
+  notificationsPermission: NotificationPermission;
+  pushToken: string | null;
+  notificationPrefs: NotificationPrefs;
+  enableNotifications: () => Promise<NotificationPermission>;
+  setNotificationPref: (key: keyof NotificationPrefs, value: boolean) => Promise<void>;
 
   requestCode: (phone: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
   verifyCode: (
@@ -170,6 +204,13 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     kind: 'idle',
   });
   const [outboxSize, setOutboxSize] = useState(0);
+
+  const [notificationsPermission, setNotificationsPermission] =
+    useState<NotificationPermission>('unknown');
+  const [pushToken, setPushToken] = useState<string | null>(null);
+  const [notificationPrefs, setNotificationPrefs] = useState<NotificationPrefs>(
+    DEFAULT_NOTIFICATION_PREFS,
+  );
 
   const hasHydratedRef = useRef(false);
 
@@ -337,10 +378,16 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       // race against the auth flow.
       authTokenRef.current = token;
 
-      const outbox = await loadOutbox();
+      const [outbox, storedPrefs, currentPerm] = await Promise.all([
+        loadOutbox(),
+        loadNotificationPrefs(),
+        getNotificationPermission(),
+      ]);
       if (!cancelled) {
         outboxRef.current = outbox;
         setOutboxSize(outbox.length);
+        if (storedPrefs) setNotificationPrefs(storedPrefs);
+        setNotificationsPermission(currentPerm);
       }
 
       hasHydratedRef.current = true;
@@ -630,9 +677,17 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     setOutboxSize(0);
     outboxRef.current = [];
     authTokenRef.current = null;
+    setNotificationPrefs(DEFAULT_NOTIFICATION_PREFS);
+    setPushToken(null);
     stepsCounter.stop();
     stepsCounter.resetDemoSteps();
-    await Promise.all([clearAuthToken(), clearLedger(), clearOutbox()]);
+    await Promise.all([
+      clearAuthToken(),
+      clearLedger(),
+      clearOutbox(),
+      clearNotificationPrefs(),
+      cancelAllReminders(),
+    ]);
   }, []);
 
   // ---------------------------------------------------------------------
@@ -696,6 +751,100 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
   const acknowledgeRedemption = useCallback(() => {
     setLastRedemption(null);
   }, []);
+
+  // ---------------------------------------------------------------------
+  // Notifications
+  // ---------------------------------------------------------------------
+  const enableNotifications = useCallback(async (): Promise<NotificationPermission> => {
+    const perm = await requestNotificationPermission();
+    setNotificationsPermission(perm);
+    if (perm === 'granted') {
+      const projectId =
+        (Constants.expoConfig?.extra as { eas?: { projectId?: string } } | undefined)?.eas?.projectId ??
+        Constants.easConfig?.projectId;
+      const token = await getExpoPushToken(projectId);
+      setPushToken(token);
+    }
+    return perm;
+  }, []);
+
+  const setNotificationPref = useCallback(
+    async (key: keyof NotificationPrefs, value: boolean) => {
+      setNotificationPrefs((current) => {
+        const next = { ...current, [key]: value };
+        void saveNotificationPrefs(next);
+        return next;
+      });
+    },
+    [],
+  );
+
+  // Reconcile scheduled reminders whenever prefs or permission state
+  // changes. Reminders are idempotent (the service cancels by identifier
+  // before scheduling), so this effect can fire freely.
+  useEffect(() => {
+    if (!isHydrated) return;
+    if (notificationsPermission !== 'granted') {
+      void cancelAllReminders();
+      return;
+    }
+
+    if (notificationPrefs.walkEveningReminder) {
+      void scheduleDailyReminder({
+        kind: 'walk-evening',
+        hour: 18,
+        minute: 0,
+        title: 'Keep walking, keep earning',
+        body: 'Check in on your steps and bank tonight\u2019s milestones before the day rolls over.',
+      });
+    } else {
+      void cancelReminder('walk-evening');
+    }
+
+    if (notificationPrefs.streakMorningReminder) {
+      void scheduleDailyReminder({
+        kind: 'streak-morning',
+        hour: 9,
+        minute: 0,
+        title: 'New day, new points',
+        body: 'A fresh set of milestones just unlocked. Lace up.',
+      });
+    } else {
+      void cancelReminder('streak-morning');
+    }
+  }, [
+    isHydrated,
+    notificationsPermission,
+    notificationPrefs.walkEveningReminder,
+    notificationPrefs.streakMorningReminder,
+  ]);
+
+  // Surface big point events as local notifications when the user is
+  // backgrounded. The in-app Alert already handles the foreground case;
+  // we only need to back-fill the background path.
+  useEffect(() => {
+    if (!isHydrated) return;
+    if (notificationsPermission !== 'granted') return;
+    if (!notificationPrefs.rewardAlerts) return;
+    if (!lastWalkMilestone) return;
+    if (RNAppState.currentState === 'active') return;
+    void fireLocalNotification({
+      title: `+${lastWalkMilestone.pointsCredited} pt earned`,
+      body: `${lastWalkMilestone.steps.toLocaleString()} steps milestone reached.`,
+    });
+  }, [isHydrated, notificationsPermission, notificationPrefs.rewardAlerts, lastWalkMilestone]);
+
+  useEffect(() => {
+    if (!isHydrated) return;
+    if (notificationsPermission !== 'granted') return;
+    if (!notificationPrefs.rewardAlerts) return;
+    if (!lastRedemption) return;
+    if (RNAppState.currentState === 'active') return;
+    void fireLocalNotification({
+      title: 'Redemption confirmed',
+      body: `${lastRedemption.rewardTitle} \u00B7 ${lastRedemption.voucherCode}`,
+    });
+  }, [isHydrated, notificationsPermission, notificationPrefs.rewardAlerts, lastRedemption]);
 
   /**
    * Pull the canonical snapshot from the server and adopt it locally.
@@ -788,6 +937,11 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       outboxSize,
       flushLedger,
       pullLedger,
+      notificationsPermission,
+      pushToken,
+      notificationPrefs,
+      enableNotifications,
+      setNotificationPref,
       requestCode,
       verifyCode,
       cancelCodeEntry,
@@ -823,6 +977,11 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       outboxSize,
       flushLedger,
       pullLedger,
+      notificationsPermission,
+      pushToken,
+      notificationPrefs,
+      enableNotifications,
+      setNotificationPref,
       requestCode,
       verifyCode,
       cancelCodeEntry,
