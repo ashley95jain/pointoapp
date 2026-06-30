@@ -33,6 +33,11 @@ export function WalletScreen() {
     lastRedemption,
     redeemReward,
     acknowledgeRedemption,
+    ledgerSyncEnabled,
+    ledgerSyncStatus,
+    outboxSize,
+    flushLedger,
+    pullLedger,
   } = useAppState();
 
   const [tab, setTab] = useState<Tab>('catalog');
@@ -104,8 +109,57 @@ export function WalletScreen() {
         ) : null}
         {tab === 'history' ? <HistoryTab redemptions={redemptions} /> : null}
         {tab === 'log' ? <ActivityTab transactions={transactions} /> : null}
+
+        {ledgerSyncEnabled ? (
+          <SyncCard
+            status={ledgerSyncStatus}
+            outboxSize={outboxSize}
+            onFlush={() => void flushLedger()}
+            onPull={async () => {
+              const r = await pullLedger();
+              if (!r.ok) Alert.alert('Sync failed', r.reason);
+            }}
+          />
+        ) : null}
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+function SyncCard({
+  status,
+  outboxSize,
+  onFlush,
+  onPull,
+}: {
+  status: { kind: string; reason?: string; at?: number };
+  outboxSize: number;
+  onFlush: () => void;
+  onPull: () => void;
+}) {
+  let label = 'Synced with server';
+  if (status.kind === 'syncing') label = 'Syncing\u2026';
+  else if (status.kind === 'error') label = `Sync failed: ${status.reason ?? 'unknown'}`;
+  else if (status.kind === 'idle' && outboxSize === 0) label = 'Ready to sync';
+
+  return (
+    <Card>
+      <Text style={styles.cardTitle}>Server-side ledger</Text>
+      <Text style={styles.cardBody}>{label}</Text>
+      {outboxSize > 0 ? (
+        <Text style={styles.outboxLine}>
+          {outboxSize} transaction{outboxSize === 1 ? '' : 's'} pending upload.
+        </Text>
+      ) : null}
+      <View style={styles.syncRow}>
+        <Pressable onPress={onFlush} style={({ pressed }) => [styles.syncButton, pressed && styles.syncButtonPressed]}>
+          <Text style={styles.syncLabel}>Push outbox</Text>
+        </Pressable>
+        <Pressable onPress={onPull} style={({ pressed }) => [styles.syncButton, pressed && styles.syncButtonPressed]}>
+          <Text style={styles.syncLabel}>Pull from server</Text>
+        </Pressable>
+      </View>
+    </Card>
   );
 }
 
@@ -490,4 +544,25 @@ const styles = StyleSheet.create({
   txDelta: { fontWeight: '800', fontVariant: ['tabular-nums'] },
   txDeltaPositive: { color: '#1E7A2E' },
   txDeltaNegative: { color: '#B23A3A' },
+
+  outboxLine: {
+    color: colors.textSecondary,
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  syncRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 6,
+  },
+  syncButton: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: radii.pill,
+    borderWidth: 1.5,
+    borderColor: colors.brand,
+    alignItems: 'center',
+  },
+  syncButtonPressed: { opacity: 0.7 },
+  syncLabel: { color: colors.brand, fontWeight: '700', fontSize: 13 },
 });

@@ -36,6 +36,12 @@ import {
   referralCodeForUserId,
   type AuthenticatedUser,
 } from '../services/auth';
+import { ledgerSync, isRetryable } from '../services/ledger';
+import {
+  clearOutbox,
+  loadOutbox,
+  saveOutbox,
+} from '../services/ledgerOutbox';
 import {
   parseReferralUrl,
   tryRedeemReferralCode,
@@ -79,6 +85,12 @@ export type RedeemResult =
   | { ok: true; redemption: Redemption }
   | { ok: false; reason: string };
 
+export type LedgerSyncStatus =
+  | { kind: 'idle' }
+  | { kind: 'syncing' }
+  | { kind: 'ok'; at: number }
+  | { kind: 'error'; at: number; reason: string };
+
 type AppStateValue = {
   isHydrated: boolean;
   authStep: AuthStep;
@@ -101,6 +113,12 @@ type AppStateValue = {
   lastRedemption: Redemption | null;
   redeemReward: (rewardId: RewardId) => RedeemResult;
   acknowledgeRedemption: () => void;
+
+  ledgerSyncEnabled: boolean;
+  ledgerSyncStatus: LedgerSyncStatus;
+  outboxSize: number;
+  flushLedger: () => Promise<void>;
+  pullLedger: () => Promise<{ ok: true } | { ok: false; reason: string }>;
 
   requestCode: (phone: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
   verifyCode: (
@@ -148,7 +166,25 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
   const [redemptions, setRedemptions] = useState<Redemption[]>([]);
   const [lastRedemption, setLastRedemption] = useState<Redemption | null>(null);
 
+  const [ledgerSyncStatus, setLedgerSyncStatus] = useState<LedgerSyncStatus>({
+    kind: 'idle',
+  });
+  const [outboxSize, setOutboxSize] = useState(0);
+
   const hasHydratedRef = useRef(false);
+
+  // Outbox state is held in a ref so addTransaction can enqueue without
+  // racing against the async setState pipeline. The ref is the source of
+  // truth; outboxSize is the React-visible mirror.
+  const outboxRef = useRef<PointTransaction[]>([]);
+  const flushInFlightRef = useRef(false);
+  const flushPendingRef = useRef(false);
+  const authTokenRef = useRef<string | null>(null);
+
+  const persistOutbox = useCallback(async () => {
+    setOutboxSize(outboxRef.current.length);
+    await saveOutbox(outboxRef.current);
+  }, []);
 
   /**
    * Single source of truth for point movements. Atomically updates the
@@ -156,6 +192,60 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
    * MAX_TRANSACTION_LOG so the persisted snapshot stays bounded). Returns
    * the synthesized transaction so callers can keep handles to it.
    */
+  /**
+   * Push the current outbox to the server-side ledger. No-ops when the
+   * sync provider is disabled (env not configured), the outbox is empty,
+   * or a flush is already in flight (the trailing call is coalesced).
+   *
+   * On a transient failure (network, 5xx, rate limit) we leave the queue
+   * intact for the next flush. On a hard rejection from the server we
+   * drop the offending entries from the outbox — the client can still
+   * see them in `transactions` for the activity log, but won't keep
+   * retrying.
+   */
+  const flushLedger = useCallback(async (): Promise<void> => {
+    if (!ledgerSync.enabled) return;
+    if (outboxRef.current.length === 0) return;
+    if (flushInFlightRef.current) {
+      flushPendingRef.current = true;
+      return;
+    }
+
+    flushInFlightRef.current = true;
+    setLedgerSyncStatus({ kind: 'syncing' });
+
+    const batch = [...outboxRef.current];
+    try {
+      const result = await ledgerSync.push(batch, authTokenRef.current);
+      const acceptedSet = new Set(result.accepted);
+      const rejectedSet = new Set(result.rejected.map((r) => r.id));
+      outboxRef.current = outboxRef.current.filter(
+        (tx) => !acceptedSet.has(tx.id) && !rejectedSet.has(tx.id),
+      );
+      await persistOutbox();
+      setLedgerSyncStatus({ kind: 'ok', at: Date.now() });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Ledger sync failed.';
+      if (!isRetryable(err)) {
+        // Drop the batch so we don't hammer the server with the same
+        // rejected entries. They remain visible in the local
+        // transaction log for diagnostics.
+        const batchIds = new Set(batch.map((tx) => tx.id));
+        outboxRef.current = outboxRef.current.filter((tx) => !batchIds.has(tx.id));
+        await persistOutbox();
+      }
+      setLedgerSyncStatus({ kind: 'error', at: Date.now(), reason: message });
+    } finally {
+      flushInFlightRef.current = false;
+      if (flushPendingRef.current) {
+        flushPendingRef.current = false;
+        // Tail-call the next flush. Awaiting here would deadlock the
+        // worker; fire-and-forget is correct.
+        void flushLedger();
+      }
+    }
+  }, [persistOutbox]);
+
   const addTransaction = useCallback(
     (input: {
       kind: TransactionKind;
@@ -178,9 +268,20 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
           ? next.slice(0, MAX_TRANSACTION_LOG)
           : next;
       });
+
+      // Enqueue for server-side ledger sync. The ref mutation is
+      // intentional — the outbox is the source of truth.
+      if (ledgerSync.enabled) {
+        outboxRef.current = [...outboxRef.current, tx];
+        void persistOutbox();
+        // Best-effort immediate flush. Failures are swallowed; the
+        // queue + foreground listener will retry.
+        void flushLedger();
+      }
+
       return tx;
     },
-    [],
+    [flushLedger, persistOutbox],
   );
 
   const referralCode = useMemo(
@@ -230,6 +331,16 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
         }
       } else {
         setWalkMilestoneDay(localDayKey());
+      }
+
+      // Cache the token in the ledger-sync ref so the first push doesn't
+      // race against the auth flow.
+      authTokenRef.current = token;
+
+      const outbox = await loadOutbox();
+      if (!cancelled) {
+        outboxRef.current = outbox;
+        setOutboxSize(outbox.length);
       }
 
       hasHydratedRef.current = true;
@@ -314,6 +425,25 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     const subscription = RNAppState.addEventListener('change', handleChange);
     return () => subscription.remove();
   }, [isHydrated, authStep.kind, walkMilestoneDay]);
+
+  // Server-side ledger flush on foreground. Independent of the steps
+  // listener because sync should also tick on web, where AppState
+  // changes still fire.
+  useEffect(() => {
+    if (!isHydrated) return;
+    if (!ledgerSync.enabled) return;
+
+    // Flush whatever's already queued (e.g. credits earned offline).
+    if (outboxRef.current.length > 0) {
+      void flushLedger();
+    }
+
+    const subscription = RNAppState.addEventListener('change', (status) => {
+      if (status !== 'active') return;
+      if (outboxRef.current.length > 0) void flushLedger();
+    });
+    return () => subscription.remove();
+  }, [isHydrated, flushLedger]);
 
   // Credit any milestones the current step count newly crosses.
   useEffect(() => {
@@ -467,8 +597,13 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
           displayName,
         });
         await saveAuthToken(result.token);
+        authTokenRef.current = result.token;
         setUser(result.user);
         setAuthStep({ kind: 'authenticated' });
+        // Drain any outbox that was waiting for a fresh token.
+        if (ledgerSync.enabled && outboxRef.current.length > 0) {
+          void flushLedger();
+        }
         return { ok: true };
       } catch (err) {
         return { ok: false, reason: errorMessage(err) };
@@ -491,9 +626,13 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     setTransactions([]);
     setRedemptions([]);
     setLastRedemption(null);
+    setLedgerSyncStatus({ kind: 'idle' });
+    setOutboxSize(0);
+    outboxRef.current = [];
+    authTokenRef.current = null;
     stepsCounter.stop();
     stepsCounter.resetDemoSteps();
-    await Promise.all([clearAuthToken(), clearLedger()]);
+    await Promise.all([clearAuthToken(), clearLedger(), clearOutbox()]);
   }, []);
 
   // ---------------------------------------------------------------------
@@ -558,6 +697,44 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     setLastRedemption(null);
   }, []);
 
+  /**
+   * Pull the canonical snapshot from the server and adopt it locally.
+   * Any still-pending outbox entries are layered back on top so an
+   * in-flight credit isn't silently lost. Returns an error result when
+   * the sync is disabled or fails — call sites decide how loudly to
+   * surface that.
+   */
+  const pullLedger = useCallback(async (): Promise<
+    { ok: true } | { ok: false; reason: string }
+  > => {
+    if (!ledgerSync.enabled) {
+      return { ok: false, reason: 'Server-side ledger sync is not configured.' };
+    }
+    setLedgerSyncStatus({ kind: 'syncing' });
+    try {
+      const remote = await ledgerSync.pull(authTokenRef.current);
+      // Reconcile: server is authoritative for balance + history; any
+      // still-queued local txs are layered on top with optimistic
+      // credits so the user doesn't see them vanish on pull.
+      const pendingIds = new Set(outboxRef.current.map((t) => t.id));
+      const serverHistory = remote.transactions.filter((t) => !pendingIds.has(t.id));
+      const merged = [...outboxRef.current, ...serverHistory].slice(
+        0,
+        MAX_TRANSACTION_LOG,
+      );
+      const optimisticDelta = outboxRef.current.reduce((a, t) => a + t.delta, 0);
+      setPoints(remote.points + optimisticDelta);
+      setTransactions(merged);
+      setRedemptions(remote.redemptions);
+      setLedgerSyncStatus({ kind: 'ok', at: Date.now() });
+      return { ok: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Ledger pull failed.';
+      setLedgerSyncStatus({ kind: 'error', at: Date.now(), reason: message });
+      return { ok: false, reason: message };
+    }
+  }, []);
+
   // ---------------------------------------------------------------------
   // Missions
   // ---------------------------------------------------------------------
@@ -606,6 +783,11 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       lastRedemption,
       redeemReward,
       acknowledgeRedemption,
+      ledgerSyncEnabled: ledgerSync.enabled,
+      ledgerSyncStatus,
+      outboxSize,
+      flushLedger,
+      pullLedger,
       requestCode,
       verifyCode,
       cancelCodeEntry,
@@ -637,6 +819,10 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       lastRedemption,
       redeemReward,
       acknowledgeRedemption,
+      ledgerSyncStatus,
+      outboxSize,
+      flushLedger,
+      pullLedger,
       requestCode,
       verifyCode,
       cancelCodeEntry,

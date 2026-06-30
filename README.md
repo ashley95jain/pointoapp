@@ -44,5 +44,26 @@ Errors are returned as `{ error: { kind, message } }` where `kind` is one of `in
 
 Variables prefixed with `EXPO_PUBLIC_` are inlined by Metro at bundle time and are therefore safe to commit only when the value is non-secret. Sensitive credentials belong in EAS Secrets, not in `.env`.
 
+## Server-side ledger (Phase 3.2)
+
+By default every point movement lives only on the device. To enable server-side reconciliation (so credits survive uninstall, and anti-fraud can reverse fraudulent transactions), add:
+
+```bash
+EXPO_PUBLIC_LEDGER_API_URL=https://ledger.pointo.app
+```
+
+The backend must implement:
+
+```
+POST /v1/ledger/transactions   headers: Authorization: Bearer <token>
+                                body:    { transactions: PointTransaction[] }
+                                200:     { accepted: string[], rejected: { id, reason }[] }
+
+GET  /v1/ledger/snapshot       headers: Authorization: Bearer <token>
+                                200:     { points: number, transactions: PointTransaction[], redemptions: Redemption[] }
+```
+
+The client persists every transaction to an outbox queue (capped at 500 entries) before showing the credit, and pushes the queue on app launch, after every credit/debit, and on each foreground. Transient errors (network, 5xx, rate-limit) keep the entries in the queue for retry; hard 4xx rejections drop them. Manual "Push outbox" and "Pull from server" controls live in the Wallet tab when the sync is enabled.
+
 ## Notes
 This project is a starter concept for a referral-based points app and can be extended with authentication, backend services, and real reward tracking.
